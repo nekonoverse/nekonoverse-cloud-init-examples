@@ -5,7 +5,7 @@
 #
 # コメントアウトの切り替えで構成を選択:
 #   - 追従ブランチ: main / develop
-#   - S3: 内部 MinIO / 外部 S3
+#   - S3: 内部 VersityGW / 外部 S3
 #   - GPU: 不使用 / ローカル GPU / 外部サービス
 #   - ネットワーク: Cloudflared / Tailscale
 #
@@ -26,10 +26,10 @@
 # TAILSCALE_AUTHKEY: "tskey-auth-xxxxx"
 
 # --- S3 ストレージ ---
-# 内部 MinIO (デフォルト — S3 は現状必須)
-# S3_ENDPOINT: "http://127.0.0.1:9000"
-# S3_ACCESS_KEY: "minioadmin"
-# S3_SECRET_KEY: "minioadmin-secret-change-me"
+# 内部 VersityGW (デフォルト — S3 は現状必須、POSIX バックエンド)
+# S3_ENDPOINT: "http://127.0.0.1:7070"
+# S3_ACCESS_KEY: "nekonoverse"
+# S3_SECRET_KEY: "change-me-s3-secret"
 # S3_BUCKET: "nekonoverse"
 # 外部 S3 互換 (Cloudflare R2, AWS S3, etc.)
 # S3_ENDPOINT: "https://your-account.r2.cloudflarestorage.com"
@@ -87,8 +87,7 @@ packages:
   # --- SELinux ---
   - selinux-utils
   - policycoreutils
-  # --- S3 内部 (MinIO) ---
-  - minio
+  # --- S3 内部 (VersityGW) — GitHub Releases から取得するためパッケージ不要 ---
   # --- ネットワーク: Cloudflared (メイン) ---
   - cloudflared
   # --- ネットワーク: Tailscale (代替) ---
@@ -154,9 +153,9 @@ write_files:
       Environment=PATH=/opt/nekonoverse/backend/.venv/bin:/usr/bin
       # Environment=DATABASE_URL=postgresql+asyncpg://nekonoverse@/nekonoverse
       # Environment=VALKEY_URL=redis://127.0.0.1:6379
-      # Environment=S3_ENDPOINT=http://127.0.0.1:9000
-      # Environment=S3_ACCESS_KEY=minioadmin
-      # Environment=S3_SECRET_KEY=minioadmin-secret-change-me
+      # Environment=S3_ENDPOINT=http://127.0.0.1:7070
+      # Environment=S3_ACCESS_KEY=nekonoverse
+      # Environment=S3_SECRET_KEY=change-me-s3-secret
       # Environment=S3_BUCKET=nekonoverse
       # Environment=SECRET_KEY=change-me-random-secret-key
       # Environment=SERVER_URL=https://your.domain.example
@@ -274,26 +273,24 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
-  # --- MinIO (内部 S3) systemd ユニット ---
-  - path: /etc/systemd/system/nekonoverse-minio.service
+  # --- VersityGW (内部 S3) systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-s3.service
     content: |
       [Unit]
-      Description=MinIO Object Storage (Nekonoverse)
+      Description=VersityGW S3 Gateway (Nekonoverse)
       After=network.target
 
       [Service]
       Type=exec
-      User=minio
-      Group=minio
-      Environment=MINIO_ROOT_USER=minioadmin
-      Environment=MINIO_ROOT_PASSWORD=minioadmin-secret-change-me
-      ExecStart=/usr/bin/minio server /var/lib/minio/data --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
+      User=nekonoverse-s3
+      Group=nekonoverse-s3
+      ExecStart=/usr/local/bin/versitygw posix /var/lib/nekonoverse-s3 --port 7070 --access ${S3_ACCESS_KEY} --secret ${S3_SECRET_KEY}
       Restart=on-failure
       RestartSec=5
 
       ProtectSystem=strict
       ProtectHome=yes
-      ReadWritePaths=/var/lib/minio
+      ReadWritePaths=/var/lib/nekonoverse-s3
       PrivateTmp=yes
       NoNewPrivileges=yes
 
@@ -448,11 +445,18 @@ runcmd:
   - cp /etc/valkey/valkey.conf.nekonoverse /etc/valkey/valkey.conf
   - systemctl enable --now valkey
 
-  # --- MinIO セットアップ (内部 S3) ---
-  - useradd -r -s /sbin/nologin minio || true
-  - mkdir -p /var/lib/minio/data
-  - chown -R minio:minio /var/lib/minio
-  - systemctl enable --now nekonoverse-minio
+  # --- VersityGW セットアップ (内部 S3) ---
+  - |
+    VERSITYGW_VERSION="v1.3.1"
+    curl -Lo /tmp/versitygw.tar.gz \
+      "https://github.com/versity/versitygw/releases/download/${VERSITYGW_VERSION}/versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+    tar xzf /tmp/versitygw.tar.gz -C /usr/local/bin/ versitygw
+    chmod +x /usr/local/bin/versitygw
+    rm -f /tmp/versitygw.tar.gz
+  - useradd -r -s /sbin/nologin nekonoverse-s3 || true
+  - mkdir -p /var/lib/nekonoverse-s3
+  - chown -R nekonoverse-s3:nekonoverse-s3 /var/lib/nekonoverse-s3
+  - systemctl enable --now nekonoverse-s3
   # 外部 S3 使用時はここをコメントアウト
 
   # --- ソースコード取得 ---
@@ -516,6 +520,6 @@ runcmd:
 
   # --- SELinux ラベル適用 ---
   - restorecon -Rv /opt/nekonoverse
-  - restorecon -Rv /var/lib/minio
+  - restorecon -Rv /var/lib/nekonoverse-s3
 
   - echo "=== Nekonoverse Cloud-Init setup complete ==="
