@@ -1,0 +1,532 @@
+#cloud-config
+# =============================================================================
+# Nekonoverse — Ubuntu Server 24.04 LTS Cloud-Init 構成例
+# =============================================================================
+#
+# コメントアウトの切り替えで構成を選択:
+#   - 追従ブランチ: main / develop
+#   - S3: 内部 VersityGW / 外部 S3
+#   - GPU: 不使用 / ローカル GPU / 外部サービス
+#   - ネットワーク: Cloudflared / Tailscale
+#
+# =============================================================================
+
+# ===== 設定 =====
+
+# --- 追従ブランチ ---
+# main (安定版)
+# NEKONOVERSE_BRANCH: main
+# develop (最新)
+# NEKONOVERSE_BRANCH: develop
+
+# --- ネットワーク ---
+# Cloudflare Tunnel トークン (メイン)
+# CLOUDFLARED_TOKEN: "your-cloudflared-tunnel-token-here"
+# Tailscale authkey (代替 — 空欄なら tailscaled のみ起動)
+# TAILSCALE_AUTHKEY: "tskey-auth-xxxxx"
+
+# --- S3 ストレージ ---
+# 内部 VersityGW (デフォルト — S3 は現状必須、POSIX バックエンド)
+# S3_ENDPOINT: "http://127.0.0.1:7070"
+# S3_ACCESS_KEY: "nekonoverse"
+# S3_SECRET_KEY: "change-me-s3-secret"
+# S3_BUCKET: "nekonoverse"
+# 外部 S3 互換 (Cloudflare R2, AWS S3, etc.)
+# S3_ENDPOINT: "https://your-account.r2.cloudflarestorage.com"
+# S3_ACCESS_KEY: "your-access-key"
+# S3_SECRET_KEY: "your-secret-key"
+# S3_BUCKET: "nekonoverse"
+
+# --- GPU (face-detect 用) ---
+# 不使用 (デフォルト — CPU フォールバック)
+# FACE_DETECT_MODE: "cpu"
+# ローカル GPU
+# FACE_DETECT_MODE: "gpu"
+# 外部サービス
+# FACE_DETECT_URL: "https://your-gpu-service/detect"
+
+# --- その他 ---
+# NEKONOVERSE_DOMAIN: "your.domain.example"
+# POSTGRES_PASSWORD: "change-me-strong-password"
+# VALKEY_PASSWORD: "change-me-valkey-password"
+# SECRET_KEY: "change-me-random-secret-key"
+
+# =============================================================================
+# ユーザー設定
+# =============================================================================
+users:
+  - name: nekonoverse
+    shell: /bin/bash
+    groups:
+      - sudo
+    sudo:
+      - ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+
+# =============================================================================
+# パッケージインストール
+# =============================================================================
+package_update: true
+package_upgrade: true
+
+# APT ソース追加 (Valkey, Cloudflared, Node.js 22)
+apt:
+  sources:
+    valkey:
+      source: "ppa:valkey/valkey"
+    nodesource:
+      source: "deb [signed-by=$KEY_FILE] https://deb.nodesource.com/node_22.x nodistro main"
+      keyid: "9FD3B784BC1C6FC31A8A0A1C1655A0AB68576280"
+    # Cloudflared (メイン)
+    cloudflared:
+      source: "deb [signed-by=$KEY_FILE] https://pkg.cloudflare.com/cloudflared any main"
+      keyid: "DE7BE5E69ADC2C456AA25A78E3E3DD710D143B55"
+    # Tailscale (代替)
+    # tailscale:
+    #   source: "deb [signed-by=$KEY_FILE] https://pkgs.tailscale.com/stable/ubuntu noble main"
+    #   keyid: "2596A99EAAB33821893C0A79458CA832957F5868"
+
+packages:
+  # --- 基盤 ---
+  - build-essential
+  - git
+  - curl
+  - python3
+  - python3-pip
+  - python3-venv
+  - nodejs
+  # --- データベース ---
+  - postgresql
+  - postgresql-client
+  # --- キャッシュ (Valkey = Redis 互換) ---
+  - valkey
+  # --- リバースプロキシ ---
+  - nginx
+  # --- セキュリティ ---
+  - apparmor
+  - apparmor-utils
+  - ufw
+  - unattended-upgrades
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - tailscale
+  # --- GPU: ローカル GPU 使用時 ---
+  # - nvidia-driver-550
+  # - nvidia-cuda-toolkit
+
+# =============================================================================
+# ファイル書き出し
+# =============================================================================
+write_files:
+  # --- PostgreSQL: unix socket 認証のみ ---
+  - path: /etc/postgresql/16/main/pg_hba.conf.nekonoverse
+    content: |
+      # TYPE  DATABASE        USER            ADDRESS         METHOD
+      local   all             postgres                        peer
+      local   nekonoverse     nekonoverse                     peer
+      # ネットワーク経由は拒否
+      # host  all             all             0.0.0.0/0       reject
+
+  # --- Valkey: localhost 限定 ---
+  - path: /etc/valkey/valkey.conf.nekonoverse
+    content: |
+      bind 127.0.0.1 ::1
+      port 6379
+      protected-mode yes
+      # requirepass ${VALKEY_PASSWORD}
+      maxmemory 256mb
+      maxmemory-policy allkeys-lru
+
+  # --- unattended-upgrades: セキュリティパッチ自動適用 ---
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades-nekonoverse
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+          "${distro_id}:${distro_codename}-security";
+      };
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  # --- Nekonoverse バックエンド systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-backend.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Backend (FastAPI/Uvicorn)
+      After=network.target postgresql.service valkey.service
+      Requires=postgresql.service valkey.service
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/backend
+      Environment=PATH=/opt/nekonoverse/backend/.venv/bin:/usr/bin
+      # Environment=DATABASE_URL=postgresql+asyncpg://nekonoverse@/nekonoverse
+      # Environment=VALKEY_URL=redis://127.0.0.1:6379
+      # Environment=S3_ENDPOINT=http://127.0.0.1:7070
+      # Environment=S3_ACCESS_KEY=nekonoverse
+      # Environment=S3_SECRET_KEY=change-me-s3-secret
+      # Environment=S3_BUCKET=nekonoverse
+      # Environment=SECRET_KEY=change-me-random-secret-key
+      # Environment=SERVER_URL=https://your.domain.example
+      ExecStart=/opt/nekonoverse/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/backend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      MemoryDenyWriteExecute=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Nekonoverse 配送ワーカー systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-worker.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Delivery Worker
+      After=network.target postgresql.service valkey.service
+      Requires=postgresql.service valkey.service
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/backend
+      Environment=PATH=/opt/nekonoverse/backend/.venv/bin:/usr/bin
+      ExecStart=/opt/nekonoverse/backend/.venv/bin/python -m app.worker.delivery_worker
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/backend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      MemoryDenyWriteExecute=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Nekonoverse フロントエンド systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-frontend.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Frontend (Vite/Node)
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/frontend
+      ExecStart=/usr/bin/node /opt/nekonoverse/frontend/node_modules/.bin/vite --host 127.0.0.1 --port 3000
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/frontend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Face-detect サービス (CPU モード) ---
+  - path: /etc/systemd/system/nekonoverse-face-detect.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Face Detection Service
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/face-detect
+      Environment=PATH=/opt/nekonoverse/face-detect/.venv/bin:/usr/bin
+      ExecStart=/opt/nekonoverse/face-detect/.venv/bin/python -m app.main
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/face-detect
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      # --- GPU 使用時はコメントアウト解除 ---
+      # DeviceAllow=/dev/nvidia0
+      # DeviceAllow=/dev/nvidiactl
+      # DeviceAllow=/dev/nvidia-uvm
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- VersityGW (内部 S3) systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-s3.service
+    content: |
+      [Unit]
+      Description=VersityGW S3 Gateway (Nekonoverse)
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=nekonoverse-s3
+      Group=nekonoverse-s3
+      ExecStart=/usr/local/bin/versitygw posix /var/lib/nekonoverse-s3 --port 7070 --access ${S3_ACCESS_KEY} --secret ${S3_SECRET_KEY}
+      Restart=on-failure
+      RestartSec=5
+
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/var/lib/nekonoverse-s3
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Cloudflared (メイン) ---
+  - path: /etc/systemd/system/nekonoverse-cloudflared.service
+    content: |
+      [Unit]
+      Description=Cloudflare Tunnel for Nekonoverse
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=exec
+      ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      DynamicUser=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Tailscale (代替) ---
+  # Tailscale を使う場合はこちらを有効化し、cloudflared を無効化
+  # - path: /etc/systemd/system/nekonoverse-tailscale-up.service
+  #   content: |
+  #     [Unit]
+  #     Description=Tailscale auto-join for Nekonoverse
+  #     After=tailscaled.service
+  #     Requires=tailscaled.service
+  #
+  #     [Service]
+  #     Type=oneshot
+  #     ExecStart=/usr/bin/tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname=nekonoverse
+  #     RemainAfterExit=yes
+  #
+  #     [Install]
+  #     WantedBy=multi-user.target
+
+  # --- nginx リバースプロキシ設定 ---
+  - path: /etc/nginx/sites-available/nekonoverse
+    content: |
+      upstream backend {
+          server 127.0.0.1:8000;
+      }
+      upstream frontend {
+          server 127.0.0.1:3000;
+      }
+
+      server {
+          listen 80 default_server;
+          # HTTPS は Cloudflared / Tailscale が終端するため、内部は HTTP
+
+          client_max_body_size 20M;
+
+          # バックエンド API
+          location /api/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # ActivityPub
+          location /.well-known/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location /inbox {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location /users/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # OAuth
+          location /oauth/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # Streaming (WebSocket)
+          location /api/v1/streaming {
+              proxy_pass http://backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_read_timeout 86400s;
+          }
+
+          # フロントエンド (それ以外すべて)
+          location / {
+              proxy_pass http://frontend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              # Vite HMR WebSocket
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+          }
+      }
+
+# =============================================================================
+# 初期化スクリプト
+# =============================================================================
+runcmd:
+  # --- 設定変数 (デフォルト値) ---
+  # main 追従 (安定版)
+  - export NEKONOVERSE_BRANCH="main"
+  # develop 追従 (最新)
+  # - export NEKONOVERSE_BRANCH="develop"
+
+  # --- UFW ファイアウォール ---
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow ssh
+  - ufw allow 80/tcp
+  - ufw --force enable
+
+  # --- PostgreSQL セットアップ ---
+  - systemctl enable --now postgresql
+  - sudo -u postgres createuser nekonoverse || true
+  - sudo -u postgres createdb -O nekonoverse nekonoverse || true
+
+  # --- Valkey セットアップ ---
+  - cp /etc/valkey/valkey.conf.nekonoverse /etc/valkey/valkey.conf
+  - systemctl enable --now valkey
+
+  # --- VersityGW セットアップ (内部 S3) ---
+  - |
+    VERSITYGW_VERSION="v1.3.1"
+    curl -Lo /tmp/versitygw.tar.gz \
+      "https://github.com/versity/versitygw/releases/download/${VERSITYGW_VERSION}/versitygw_${VERSITYGW_VERSION}_Linux_x86_64.tar.gz"
+    tar xzf /tmp/versitygw.tar.gz -C /usr/local/bin/ versitygw
+    chmod +x /usr/local/bin/versitygw
+    rm -f /tmp/versitygw.tar.gz
+  - useradd -r -s /usr/sbin/nologin nekonoverse-s3 || true
+  - mkdir -p /var/lib/nekonoverse-s3
+  - chown -R nekonoverse-s3:nekonoverse-s3 /var/lib/nekonoverse-s3
+  - systemctl enable --now nekonoverse-s3
+  # 外部 S3 使用時はここをコメントアウト
+
+  # --- ソースコード取得 ---
+  - mkdir -p /opt/nekonoverse
+  - chown nekonoverse:nekonoverse /opt/nekonoverse
+  - sudo -u nekonoverse git clone --branch ${NEKONOVERSE_BRANCH} --depth 1 https://github.com/nekonoverse/nekonoverse.git /opt/nekonoverse
+
+  # --- バックエンド セットアップ ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/backend
+      python3 -m venv .venv
+      .venv/bin/pip install --upgrade pip
+      .venv/bin/pip install -r requirements.txt
+    '
+
+  # --- フロントエンド セットアップ ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/frontend
+      npm ci
+    '
+
+  # --- Face-detect セットアップ (CPU モード) ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/face-detect
+      python3 -m venv .venv
+      .venv/bin/pip install --upgrade pip
+      .venv/bin/pip install -r requirements.txt
+    '
+  # GPU モード使用時:
+  # - .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+  # --- nginx セットアップ ---
+  - ln -sf /etc/nginx/sites-available/nekonoverse /etc/nginx/sites-enabled/nekonoverse
+  - rm -f /etc/nginx/sites-enabled/default
+  - systemctl enable --now nginx
+
+  # --- DB マイグレーション ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/backend
+      .venv/bin/python -m alembic upgrade head
+    '
+
+  # --- サービス起動 ---
+  - systemctl enable --now nekonoverse-backend
+  - systemctl enable --now nekonoverse-worker
+  - systemctl enable --now nekonoverse-frontend
+  - systemctl enable --now nekonoverse-face-detect
+
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - systemctl enable --now nekonoverse-cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - systemctl enable --now tailscaled
+  # - systemctl enable --now nekonoverse-tailscale-up
+
+  # --- unattended-upgrades 有効化 ---
+  - dpkg-reconfigure -plow unattended-upgrades
+
+  - echo "=== Nekonoverse Cloud-Init setup complete ==="

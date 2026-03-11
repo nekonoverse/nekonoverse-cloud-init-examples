@@ -67,7 +67,7 @@ main() {
   # --- ディストリビューション選択 ---
   pick "ディストリビューションを選択" \
     "Arch Linux" \
-    "(今後追加予定)"
+    "Ubuntu Server 24.04 LTS"
 
   local distro=""
   local template=""
@@ -80,8 +80,16 @@ main() {
         exit 1
       fi
       ;;
+    2)
+      distro="ubuntu"
+      template="${SCRIPT_DIR}/ubuntu/user-data"
+      if [[ ! -f "$template" ]]; then
+        err "テンプレートが見つかりません: $template"
+        exit 1
+      fi
+      ;;
     *)
-      warn "現在 Arch Linux のみ対応しています"
+      warn "未対応のディストリビューションです"
       exit 0
       ;;
   esac
