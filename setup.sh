@@ -116,11 +116,14 @@ main() {
     [[ -z "$cf_token" ]] && { err "トークンは必須です"; exit 1; }
   else
     network="tailscale"
-    ask "Tailscale authkey" ""
+    ask "Tailscale authkey (空欄で tailscaled のみ起動)" ""
     ts_authkey="$REPLY"
-    [[ -z "$ts_authkey" ]] && { err "authkey は必須です"; exit 1; }
   fi
-  ok "ネットワーク: ${network}"
+  if [[ "$network" == "tailscale" && -z "$ts_authkey" ]]; then
+    ok "ネットワーク: tailscale (tailscaled のみ、手動 login)"
+  else
+    ok "ネットワーク: ${network}"
+  fi
 
   # --- S3 ストレージ ---
   pick "S3 ストレージ" \
@@ -198,14 +201,17 @@ main() {
   if [[ "$network" == "tailscale" ]]; then
     # cloudflared を無効化
     content="$(echo "$content" | sed 's/^  - systemctl enable --now nekonoverse-cloudflared/  # - systemctl enable --now nekonoverse-cloudflared/')"
-    # tailscale を有効化
+    # tailscaled を有効化
     content="$(echo "$content" | sed 's/^  # - systemctl enable --now tailscaled/  - systemctl enable --now tailscaled/')"
-    content="$(echo "$content" | sed 's/^  # - systemctl enable --now nekonoverse-tailscale-up/  - systemctl enable --now nekonoverse-tailscale-up/')"
     # パッケージ
     content="$(echo "$content" | sed 's/^  - cloudflared/  # - cloudflared/')"
     content="$(echo "$content" | sed 's/^  # - tailscale/  - tailscale/')"
-    # Tailscale ユニットファイルのコメント解除
-    content="$(echo "$content" | sed '/^  # - path: \/etc\/systemd\/system\/nekonoverse-tailscale-up.service/,/^  #     WantedBy=multi-user.target/ s/^  # /  /')"
+    # authkey がある場合のみ tailscale-up を有効化
+    if [[ -n "$ts_authkey" ]]; then
+      content="$(echo "$content" | sed 's/^  # - systemctl enable --now nekonoverse-tailscale-up/  - systemctl enable --now nekonoverse-tailscale-up/')"
+      # Tailscale ユニットファイルのコメント解除
+      content="$(echo "$content" | sed '/^  # - path: \/etc\/systemd\/system\/nekonoverse-tailscale-up.service/,/^  #     WantedBy=multi-user.target/ s/^  # /  /')"
+    fi
   fi
 
   # 外部 S3 選択時: VersityGW セットアップをコメントアウト
@@ -236,7 +242,11 @@ main() {
   echo -e "  ディストリビューション: ${distro}"
   echo -e "  ブランチ:         ${branch}"
   echo -e "  ドメイン:         ${domain}"
-  echo -e "  ネットワーク:     ${network}"
+  if [[ "$network" == "tailscale" && -z "$ts_authkey" ]]; then
+    echo -e "  ネットワーク:     tailscale (tailscaled のみ → 手動 tailscale up)"
+  else
+    echo -e "  ネットワーク:     ${network}"
+  fi
   echo -e "  S3:               ${s3_mode} (${s3_endpoint})"
   echo -e "  GPU:              ${gpu_mode}"
   echo
