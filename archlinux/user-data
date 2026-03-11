@@ -1,0 +1,521 @@
+#cloud-config
+# =============================================================================
+# Nekonoverse — Arch Linux Cloud-Init 構成例
+# =============================================================================
+#
+# コメントアウトの切り替えで構成を選択:
+#   - 追従ブランチ: main / develop
+#   - S3: 内部 MinIO / 外部 S3
+#   - GPU: 不使用 / ローカル GPU / 外部サービス
+#   - ネットワーク: Cloudflared / Tailscale
+#
+# =============================================================================
+
+# ===== 設定 =====
+
+# --- 追従ブランチ ---
+# main (安定版)
+# NEKONOVERSE_BRANCH: main
+# develop (最新)
+# NEKONOVERSE_BRANCH: develop
+
+# --- ネットワーク ---
+# Cloudflare Tunnel トークン (メイン)
+# CLOUDFLARED_TOKEN: "your-cloudflared-tunnel-token-here"
+# Tailscale authkey (代替)
+# TAILSCALE_AUTHKEY: "tskey-auth-xxxxx"
+
+# --- S3 ストレージ ---
+# 内部 MinIO (デフォルト — S3 は現状必須)
+# S3_ENDPOINT: "http://127.0.0.1:9000"
+# S3_ACCESS_KEY: "minioadmin"
+# S3_SECRET_KEY: "minioadmin-secret-change-me"
+# S3_BUCKET: "nekonoverse"
+# 外部 S3 互換 (Cloudflare R2, AWS S3, etc.)
+# S3_ENDPOINT: "https://your-account.r2.cloudflarestorage.com"
+# S3_ACCESS_KEY: "your-access-key"
+# S3_SECRET_KEY: "your-secret-key"
+# S3_BUCKET: "nekonoverse"
+
+# --- GPU (face-detect 用) ---
+# 不使用 (デフォルト — CPU フォールバック)
+# FACE_DETECT_MODE: "cpu"
+# ローカル GPU
+# FACE_DETECT_MODE: "gpu"
+# 外部サービス
+# FACE_DETECT_URL: "https://your-gpu-service/detect"
+
+# --- その他 ---
+# NEKONOVERSE_DOMAIN: "your.domain.example"
+# POSTGRES_PASSWORD: "change-me-strong-password"
+# VALKEY_PASSWORD: "change-me-valkey-password"
+# SECRET_KEY: "change-me-random-secret-key"
+
+# =============================================================================
+# ユーザー設定
+# =============================================================================
+users:
+  - name: nekonoverse
+    shell: /bin/bash
+    groups:
+      - wheel
+    sudo:
+      - ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+
+# =============================================================================
+# パッケージインストール
+# =============================================================================
+package_update: true
+package_upgrade: true
+
+packages:
+  # --- 基盤 ---
+  - base-devel
+  - git
+  - python
+  - python-pip
+  - python-virtualenv
+  - nodejs
+  - npm
+  # --- データベース ---
+  - postgresql
+  # --- キャッシュ (Valkey = Redis 互換) ---
+  - valkey
+  # --- リバースプロキシ ---
+  - nginx
+  # --- SELinux ---
+  - selinux-utils
+  - policycoreutils
+  # --- S3 内部 (MinIO) ---
+  - minio
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - tailscale
+  # --- GPU: ローカル GPU 使用時 ---
+  # - python-pytorch
+  # - python-torchvision
+  # - cuda
+  # - cudnn
+
+# =============================================================================
+# SELinux 有効化
+# =============================================================================
+bootcmd:
+  - |
+    # SELinux: カーネルパラメータ確認 (cloud イメージによっては要設定)
+    if ! grep -q 'selinux=1' /proc/cmdline; then
+      echo "WARNING: SELinux kernel parameter not set. Add 'selinux=1 security=selinux' to boot params."
+    fi
+
+# =============================================================================
+# ファイル書き出し
+# =============================================================================
+write_files:
+  # --- SELinux 設定 ---
+  - path: /etc/selinux/config
+    content: |
+      SELINUX=enforcing
+      SELINUXTYPE=targeted
+
+  # --- PostgreSQL: unix socket 認証のみ ---
+  - path: /etc/postgresql/pg_hba.conf.nekonoverse
+    content: |
+      # TYPE  DATABASE        USER            ADDRESS         METHOD
+      local   all             postgres                        peer
+      local   nekonoverse     nekonoverse                     peer
+      # ネットワーク経由は拒否
+      # host  all             all             0.0.0.0/0       reject
+
+  # --- Valkey: localhost 限定 ---
+  - path: /etc/valkey/valkey.conf.nekonoverse
+    content: |
+      bind 127.0.0.1 ::1
+      port 6379
+      protected-mode yes
+      # requirepass ${VALKEY_PASSWORD}
+      maxmemory 256mb
+      maxmemory-policy allkeys-lru
+
+  # --- Nekonoverse バックエンド systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-backend.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Backend (FastAPI/Uvicorn)
+      After=network.target postgresql.service valkey.service
+      Requires=postgresql.service valkey.service
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/backend
+      Environment=PATH=/opt/nekonoverse/backend/.venv/bin:/usr/bin
+      # Environment=DATABASE_URL=postgresql+asyncpg://nekonoverse@/nekonoverse
+      # Environment=VALKEY_URL=redis://127.0.0.1:6379
+      # Environment=S3_ENDPOINT=http://127.0.0.1:9000
+      # Environment=S3_ACCESS_KEY=minioadmin
+      # Environment=S3_SECRET_KEY=minioadmin-secret-change-me
+      # Environment=S3_BUCKET=nekonoverse
+      # Environment=SECRET_KEY=change-me-random-secret-key
+      # Environment=SERVER_URL=https://your.domain.example
+      ExecStart=/opt/nekonoverse/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/backend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      MemoryDenyWriteExecute=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Nekonoverse 配送ワーカー systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-worker.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Delivery Worker
+      After=network.target postgresql.service valkey.service
+      Requires=postgresql.service valkey.service
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/backend
+      Environment=PATH=/opt/nekonoverse/backend/.venv/bin:/usr/bin
+      ExecStart=/opt/nekonoverse/backend/.venv/bin/python -m app.worker.delivery_worker
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/backend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+      MemoryDenyWriteExecute=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Nekonoverse フロントエンド systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-frontend.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Frontend (Vite/Node)
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/frontend
+      ExecStart=/usr/bin/node /opt/nekonoverse/frontend/node_modules/.bin/vite --host 127.0.0.1 --port 3000
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/frontend
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+      ProtectKernelTunables=yes
+      ProtectKernelModules=yes
+      ProtectControlGroups=yes
+      RestrictSUIDSGID=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Face-detect サービス (CPU モード) ---
+  - path: /etc/systemd/system/nekonoverse-face-detect.service
+    content: |
+      [Unit]
+      Description=Nekonoverse Face Detection Service
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=nekonoverse
+      Group=nekonoverse
+      WorkingDirectory=/opt/nekonoverse/face-detect
+      Environment=PATH=/opt/nekonoverse/face-detect/.venv/bin:/usr/bin
+      ExecStart=/opt/nekonoverse/face-detect/.venv/bin/python -m app.main
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/opt/nekonoverse/face-detect
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      # --- GPU 使用時はコメントアウト解除 ---
+      # DeviceAllow=/dev/nvidia0
+      # DeviceAllow=/dev/nvidiactl
+      # DeviceAllow=/dev/nvidia-uvm
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- MinIO (内部 S3) systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-minio.service
+    content: |
+      [Unit]
+      Description=MinIO Object Storage (Nekonoverse)
+      After=network.target
+
+      [Service]
+      Type=exec
+      User=minio
+      Group=minio
+      Environment=MINIO_ROOT_USER=minioadmin
+      Environment=MINIO_ROOT_PASSWORD=minioadmin-secret-change-me
+      ExecStart=/usr/bin/minio server /var/lib/minio/data --address 127.0.0.1:9000 --console-address 127.0.0.1:9001
+      Restart=on-failure
+      RestartSec=5
+
+      ProtectSystem=strict
+      ProtectHome=yes
+      ReadWritePaths=/var/lib/minio
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Cloudflared (メイン) ---
+  - path: /etc/systemd/system/nekonoverse-cloudflared.service
+    content: |
+      [Unit]
+      Description=Cloudflare Tunnel for Nekonoverse
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=exec
+      ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+      Restart=on-failure
+      RestartSec=5
+
+      # --- セキュリティ強化 ---
+      DynamicUser=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Tailscale (代替) ---
+  # Tailscale を使う場合はこちらを有効化し、cloudflared を無効化
+  # - path: /etc/systemd/system/nekonoverse-tailscale-up.service
+  #   content: |
+  #     [Unit]
+  #     Description=Tailscale auto-join for Nekonoverse
+  #     After=tailscaled.service
+  #     Requires=tailscaled.service
+  #
+  #     [Service]
+  #     Type=oneshot
+  #     ExecStart=/usr/bin/tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname=nekonoverse
+  #     RemainAfterExit=yes
+  #
+  #     [Install]
+  #     WantedBy=multi-user.target
+
+  # --- nginx リバースプロキシ設定 ---
+  - path: /etc/nginx/sites-available/nekonoverse.conf
+    content: |
+      upstream backend {
+          server 127.0.0.1:8000;
+      }
+      upstream frontend {
+          server 127.0.0.1:3000;
+      }
+
+      server {
+          listen 80 default_server;
+          # HTTPS は Cloudflared / Tailscale が終端するため、内部は HTTP
+
+          client_max_body_size 20M;
+
+          # バックエンド API
+          location /api/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # ActivityPub
+          location /.well-known/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location /inbox {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          location /users/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # OAuth
+          location /oauth/ {
+              proxy_pass http://backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+
+          # Streaming (WebSocket)
+          location /api/v1/streaming {
+              proxy_pass http://backend;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              proxy_read_timeout 86400s;
+          }
+
+          # フロントエンド (それ以外すべて)
+          location / {
+              proxy_pass http://frontend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              # Vite HMR WebSocket
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+          }
+      }
+
+# =============================================================================
+# 初期化スクリプト
+# =============================================================================
+runcmd:
+  # --- 設定変数 (デフォルト値) ---
+  # main 追従 (安定版)
+  - export NEKONOVERSE_BRANCH="main"
+  # develop 追従 (最新)
+  # - export NEKONOVERSE_BRANCH="develop"
+
+  # --- SELinux 有効化 ---
+  - setenforce 1 || true
+  - restorecon -Rv /opt/nekonoverse || true
+
+  # --- PostgreSQL セットアップ ---
+  - systemctl enable --now postgresql
+  - sudo -u postgres initdb -D /var/lib/postgres/data || true
+  - sudo -u postgres createuser nekonoverse || true
+  - sudo -u postgres createdb -O nekonoverse nekonoverse || true
+
+  # --- Valkey セットアップ ---
+  - cp /etc/valkey/valkey.conf.nekonoverse /etc/valkey/valkey.conf
+  - systemctl enable --now valkey
+
+  # --- MinIO セットアップ (内部 S3) ---
+  - useradd -r -s /sbin/nologin minio || true
+  - mkdir -p /var/lib/minio/data
+  - chown -R minio:minio /var/lib/minio
+  - systemctl enable --now nekonoverse-minio
+  # 外部 S3 使用時はここをコメントアウト
+
+  # --- ソースコード取得 ---
+  - mkdir -p /opt/nekonoverse
+  - chown nekonoverse:nekonoverse /opt/nekonoverse
+  - sudo -u nekonoverse git clone --branch ${NEKONOVERSE_BRANCH} --depth 1 https://github.com/nekonoverse/nekonoverse.git /opt/nekonoverse
+
+  # --- バックエンド セットアップ ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/backend
+      python -m venv .venv
+      .venv/bin/pip install --upgrade pip
+      .venv/bin/pip install -r requirements.txt
+    '
+
+  # --- フロントエンド セットアップ ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/frontend
+      npm ci
+    '
+
+  # --- Face-detect セットアップ (CPU モード) ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/face-detect
+      python -m venv .venv
+      .venv/bin/pip install --upgrade pip
+      .venv/bin/pip install -r requirements.txt
+    '
+  # GPU モード使用時:
+  # - .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+  # --- nginx セットアップ ---
+  - mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  - ln -sf /etc/nginx/sites-available/nekonoverse.conf /etc/nginx/sites-enabled/nekonoverse.conf
+  - rm -f /etc/nginx/sites-enabled/default
+  # nginx.conf に sites-enabled の include がない場合は追記
+  - grep -q 'sites-enabled' /etc/nginx/nginx.conf || sed -i '/http {/a \    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
+  - systemctl enable --now nginx
+
+  # --- DB マイグレーション ---
+  - |
+    sudo -u nekonoverse bash -c '
+      cd /opt/nekonoverse/backend
+      .venv/bin/python -m alembic upgrade head
+    '
+
+  # --- サービス起動 ---
+  - systemctl enable --now nekonoverse-backend
+  - systemctl enable --now nekonoverse-worker
+  - systemctl enable --now nekonoverse-frontend
+  - systemctl enable --now nekonoverse-face-detect
+
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - systemctl enable --now nekonoverse-cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - systemctl enable --now tailscaled
+  # - systemctl enable --now nekonoverse-tailscale-up
+
+  # --- SELinux ラベル適用 ---
+  - restorecon -Rv /opt/nekonoverse
+  - restorecon -Rv /var/lib/minio
+
+  - echo "=== Nekonoverse Cloud-Init setup complete ==="
