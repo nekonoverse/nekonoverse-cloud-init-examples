@@ -1,0 +1,201 @@
+#cloud-config
+# =============================================================================
+# Nekonoverse — Debian 13 (Trixie) Cloud-Init 構成例 (Docker Compose)
+# =============================================================================
+#
+# Docker Compose でサービス一式を起動する構成。
+# PostgreSQL / Valkey / nginx 等はすべてコンテナ内で動作。
+#
+# コメントアウトの切り替えで構成を選択:
+#   - 追従ブランチ: main / develop
+#   - ネットワーク: Cloudflared / Tailscale
+#
+# 注意: Debian は sudo が未インストールのため、本構成で自動インストールします。
+#
+# =============================================================================
+
+# ===== 設定 =====
+
+# --- 追従ブランチ ---
+# main (安定版)
+# NEKONOVERSE_BRANCH: main
+# develop (最新)
+# NEKONOVERSE_BRANCH: develop
+
+# --- ネットワーク ---
+# Cloudflare Tunnel トークン (メイン)
+# CLOUDFLARED_TOKEN: "your-cloudflared-tunnel-token-here"
+# Tailscale authkey (代替 — 空欄なら tailscaled のみ起動)
+# TAILSCALE_AUTHKEY: "tskey-auth-xxxxx"
+
+# --- その他 ---
+# NEKONOVERSE_DOMAIN: "your.domain.example"
+
+# =============================================================================
+# sudo 早期インストール (Debian はデフォルトで sudo が入っていない)
+# =============================================================================
+bootcmd:
+  - |
+    if ! command -v sudo >/dev/null 2>&1; then
+      apt-get update -q
+      apt-get install -y -q sudo
+    fi
+
+# =============================================================================
+# ユーザー設定
+# =============================================================================
+users:
+  - name: nekonoverse
+    shell: /bin/bash
+    groups:
+      - sudo
+      - docker
+    sudo:
+      - ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+
+# =============================================================================
+# パッケージインストール
+# =============================================================================
+package_update: true
+package_upgrade: true
+
+apt:
+  sources:
+    docker-ce:
+      source: "deb [signed-by=$KEY_FILE] https://download.docker.com/linux/debian trixie stable"
+      keyid: "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+    # Cloudflared (メイン)
+    cloudflared:
+      source: "deb [signed-by=$KEY_FILE] https://pkg.cloudflare.com/cloudflared any main"
+      keyid: "DE7BE5E69ADC2C456AA25A78E3E3DD710D143B55"
+    # Tailscale (代替)
+    # tailscale:
+    #   source: "deb [signed-by=$KEY_FILE] https://pkgs.tailscale.com/stable/debian trixie main"
+    #   keyid: "2596A99EAAB33821893C0A79458CA832957F5868"
+
+packages:
+  - sudo
+  - git
+  - curl
+  # --- Docker ---
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-compose-plugin
+  # --- セキュリティ ---
+  - ufw
+  - unattended-upgrades
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - tailscale
+
+# =============================================================================
+# ファイル書き出し
+# =============================================================================
+write_files:
+  # --- unattended-upgrades: セキュリティパッチ自動適用 ---
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades-nekonoverse
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+          "Debian:trixie-security";
+      };
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+  # --- Cloudflared (メイン) ---
+  - path: /etc/systemd/system/nekonoverse-cloudflared.service
+    content: |
+      [Unit]
+      Description=Cloudflare Tunnel for Nekonoverse
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=exec
+      ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}
+      Restart=on-failure
+      RestartSec=5
+
+      DynamicUser=yes
+      ProtectSystem=strict
+      ProtectHome=yes
+      PrivateTmp=yes
+      NoNewPrivileges=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- Tailscale (代替) ---
+  # - path: /etc/systemd/system/nekonoverse-tailscale-up.service
+  #   content: |
+  #     [Unit]
+  #     Description=Tailscale auto-join for Nekonoverse
+  #     After=tailscaled.service
+  #     Requires=tailscaled.service
+  #
+  #     [Service]
+  #     Type=oneshot
+  #     ExecStart=/usr/bin/tailscale up --authkey=${TAILSCALE_AUTHKEY} --hostname=nekonoverse
+  #     RemainAfterExit=yes
+  #
+  #     [Install]
+  #     WantedBy=multi-user.target
+
+  # --- Docker Compose 自動起動 systemd ユニット ---
+  - path: /etc/systemd/system/nekonoverse-compose.service
+    content: |
+      [Unit]
+      Description=Nekonoverse (Docker Compose)
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      User=nekonoverse
+      WorkingDirectory=/opt/nekonoverse
+      ExecStart=/usr/bin/docker compose up -d
+      ExecStop=/usr/bin/docker compose down
+
+      [Install]
+      WantedBy=multi-user.target
+
+# =============================================================================
+# 初期化スクリプト
+# =============================================================================
+runcmd:
+  # --- 設定変数 (デフォルト値) ---
+  # main 追従 (安定版)
+  - export NEKONOVERSE_BRANCH="main"
+  # develop 追従 (最新)
+  # - export NEKONOVERSE_BRANCH="develop"
+
+  # --- UFW ファイアウォール ---
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow ssh
+  - ufw allow 80/tcp
+  - ufw --force enable
+
+  # --- Docker 有効化 ---
+  - systemctl enable --now docker
+
+  # --- ソースコード取得 ---
+  - mkdir -p /opt/nekonoverse
+  - chown nekonoverse:nekonoverse /opt/nekonoverse
+  - sudo -u nekonoverse git clone --branch ${NEKONOVERSE_BRANCH} --depth 1 https://github.com/nekonoverse/nekonoverse.git /opt/nekonoverse
+
+  # --- Docker Compose 起動 ---
+  - systemctl enable --now nekonoverse-compose
+
+  # --- ネットワーク: Cloudflared (メイン) ---
+  - systemctl enable --now nekonoverse-cloudflared
+  # --- ネットワーク: Tailscale (代替) ---
+  # - systemctl enable --now tailscaled
+  # - systemctl enable --now nekonoverse-tailscale-up
+
+  # --- unattended-upgrades 有効化 ---
+  - dpkg-reconfigure -plow unattended-upgrades
+
+  - echo "=== Nekonoverse Cloud-Init (Docker Compose) setup complete ==="

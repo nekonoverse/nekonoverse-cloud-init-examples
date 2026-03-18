@@ -67,6 +67,7 @@ main() {
   # --- ディストリビューション選択 ---
   pick "ディストリビューションを選択" \
     "Arch Linux" \
+    "Debian 13 (Trixie)" \
     "Ubuntu Server 24.04 LTS"
 
   local distro=""
@@ -81,6 +82,14 @@ main() {
       fi
       ;;
     2)
+      distro="debian"
+      template="${SCRIPT_DIR}/debian/user-data"
+      if [[ ! -f "$template" ]]; then
+        err "テンプレートが見つかりません: $template"
+        exit 1
+      fi
+      ;;
+    3)
       distro="ubuntu"
       template="${SCRIPT_DIR}/ubuntu/user-data"
       if [[ ! -f "$template" ]]; then
